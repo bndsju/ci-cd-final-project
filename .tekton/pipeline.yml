@@ -1,0 +1,106 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: cd-pipeline
+spec:
+  workspaces:
+    - name: output
+  params:
+    - name: repo-url
+      type: string
+      description: The URL of the git repository
+    - name: branch
+      type: string
+      description: The git branch to build
+      default: "main"
+    - name: build-image
+      type: string
+      description: Full name of the image to build and push
+    - name: app-name
+      type: string
+      description: Name of the application to deploy
+      default: "app"
+
+  tasks:
+    # 1. Clean up the workspace before cloning
+    - name: cleanup
+      taskRef:
+        name: cleanup
+        kind: Task
+      workspaces:
+        - name: source
+          workspace: output
+
+    # 2. Clone the source code
+    - name: git-clone
+      runAfter:
+        - cleanup
+      taskRef:
+        name: git-clone
+        kind: ClusterTask
+      workspaces:
+        - name: output
+          workspace: output
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.branch)
+
+    # 3. Lint step
+    - name: flake8
+      runAfter:
+        - git-clone
+      taskRef:
+        name: flake8
+        kind: Task
+      workspaces:
+        - name: source
+          workspace: output
+      params:
+        - name: args
+          value: "service --count --max-complexity=10 --max-line-length=127 --statistics"
+
+    # 4. Unit test step
+    - name: nose
+      runAfter:
+        - git-clone
+      taskRef:
+        name: nose
+        kind: Task
+      workspaces:
+        - name: source
+          workspace: output
+      params:
+        - name: args
+          value: "-v"
+
+    # 5. Build the image (runs only after lint + tests pass)
+    - name: buildah
+      runAfter:
+        - flake8
+        - nose
+      taskRef:
+        name: buildah
+        kind: ClusterTask
+      workspaces:
+        - name: source
+          workspace: output
+      params:
+        - name: IMAGE
+          value: $(params.build-image)
+
+    # 6. Deploy step
+    - name: deploy
+      runAfter:
+        - buildah
+      taskRef:
+        name: openshift-client
+        kind: ClusterTask
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+      params:
+        - name: SCRIPT
+          value: |
+            oc create deployment $(params.app-name) --image=$(params.build-image) --dry-run=client -o yaml | oc apply -f -
